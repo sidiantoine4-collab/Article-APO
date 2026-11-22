@@ -1,0 +1,277 @@
+---
+title: "CC2 APO : Article du début jusqu'à Phyloseq"
+author: "Antoine"
+date: "2026-10-07"
+output: github_document
+---
+
+```{r}
+# Lire le fichier CSV contenant le tableau des métadonnées des échantillons
+tableau<- read.csv("data/SraRunTable.csv")
+
+```
+
+```{r}
+# Charger le package DADA2
+library(dada2); packageVersion("dada2")
+```
+```{r}
+# Charger DADA2
+library(dada2)
+
+# Chemin vers les données
+path <- "data"
+
+```
+
+```{r}
+# Identifier les fichiers R1 et R2
+fnFs <- sort(list.files(path, pattern = "_1.fastq.gz$", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_2.fastq.gz$", full.names = TRUE))
+```
+
+```{r}
+# Sélectionner les 100 premiers fichiers de chaque liste(consigne du prof vu qu'il y'en avait 500 dans l'article choisi)
+#on garde garde les 100 premiers fichiers R1 et R2
+fnFs <- fnFs[1:100]
+fnRs <- fnRs[1:100]
+
+# Extraire l'identifiant de chaque échantillon (partie avant le premier "_")
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+```{r}
+#afficher les profils de qualité des deux premiers fichiers R1
+plotQualityProfile(fnFs[1:2])
+```
+0 à 160 pb : La qualité moyenne  reste au-dessus ou proche de 30, et les quartiles restent stables.
+
+160-170 pb : La moyenne commence à descendre sous 30, et le bas du quartile  décroche très fortement vers des scores de 10-15.
+
+Au-delà de 200 pb : La qualité chute sous 25 de manière généralisée.
+
+Couper à truncLen = 160  permet de garder le maximum de séquences propres avant que les erreurs n'augmentent de trop.
+
+```{r}
+# afficher les profils de qualité des deux premiers fichiers R2
+plotQualityProfile(fnRs[1:2])
+```
+
+Jusqu'à 140–150 pb : La moyenne oscille péniblement autour de 30, mais les quartiles bas  tombent déjà sous 20 dès les premiers cycles.
+Fwd = 160 et Rev = 140
+
+FILTER AND TRIM
+```{r}
+# Définir les chemins de sortie pour les fichiers R1 filtrés
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+
+# Définir les chemins de sortie pour les fichiers R2 filtrés
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+
+# Associer chaque chemin de sortie R1 à son nom d'échantillon
+names(filtFs) <- sample.names
+
+# Associer chaque chemin de sortie R2 à son nom d'échantillon
+names(filtRs) <- sample.names
+```
+
+```{r}
+# Filtrer les séquences R1 et R2 et enregistrer les fichiers filtrés
+out <- filterAndTrim(
+  fnFs, filtFs,       # Fichiers R1 : entrée puis sortie
+  fnRs, filtRs,       # Fichiers R2 : entrée puis sortie
+  truncLen = c(160, 140), # Conserver 160 bases pour R1 et 140 pour R2
+  maxN = 0,           # Éliminer les reads contenant au moins une base inconnue (N)
+  maxEE = c(2, 2),    # Accepter au maximum 2 erreurs attendues pour R1 et R2
+  truncQ = 2,         # Tronquer les reads à partir d'une base de qualité <= 2
+  rm.phix = TRUE,     # Retirer les séquences PhiX
+  compress = TRUE,    # Compresser les fichiers de sortie en .gz
+  multithread = FALSE # Ne pas utiliser le traitement parallèle
+)
+
+# Afficher les premières lignes du bilan de filtrage
+head(out)
+```
+
+Learn the Error Rates
+
+```{r}
+# Apprendre le modèle d'erreurs de séquençage à partir des fichiers R1 filtrés
+errF <- learnErrors(filtFs, multithread=FALSE)
+```
+```{r}
+# Apprendre le modèle d'erreurs de séquençage à partir des fichiers R2 filtrés
+errR <- learnErrors(filtRs, multithread=FALSE)
+```
+
+```{r}
+
+plotErrors(errF, nominalQ=TRUE)
+```
+
+
+Sample Inference
+```{r}
+#Repérer les vrai séquences d’ADN présentes , en distinguant les différences des erreurs de lecture pour R1
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+```
+
+```{r}
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+```{r}
+dadaFs[[1]]
+```
+
+Merge paired reads
+```{r}
+#Fusionner les séquences R1 et R2 correspondantes pour reconstituer les séquences complètes
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=FALSE)
+
+#affiche les premieres lignes
+print(head(mergers[[1]]))
+```
+
+Construct sequence table
+```{r}
+#Construire une table regroupant les séquences fusionnées de tous les échantillons.
+seqtab <- makeSequenceTable(mergers)
+
+#dimesion de la table
+dim(seqtab)
+```
+
+```{r}
+table(nchar(getSequences(seqtab)))
+```
+
+Remove chimeras
+```{r}
+# Retirer les séquences chimériques du tableau de séquences
+seqtab.nochim <- removeBimeraDenovo(
+  seqtab,
+  method = "consensus",
+  multithread = FALSE,
+  verbose = TRUE
+)
+
+dim(seqtab.nochim)
+```
+
+```{r}
+#Calculer la proportion des séquences conservées après le retrait des chimères
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+Track reads through the pipeline
+```{r}
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(
+  out,
+  sapply(dadaFs, getN),
+  sapply(dadaRs, getN),
+  sapply(mergers, getN),
+  rowSums(seqtab.nochim)
+)
+
+colnames(track) <- c(
+  "input", "filtered", "denoisedF", "denoisedR",
+  "merged", "nonchim"
+)
+
+rownames(track) <- sample.names
+head(track)
+```
+
+Assign taxonomy
+```{r}
+#Attribuer une classification taxonomique aux séquences sans chimères à l'aide de la base SILVA.
+taxa <- readRDS("data/taxa_silva.rds")
+```
+
+```{r}
+taxa.print <- taxa 
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+Handoff to phyloseq
+
+```{r}
+library(phyloseq); packageVersion("phyloseq")
+```
+```{r}
+library(Biostrings); packageVersion("Biostrings")
+library(ggplot2); packageVersion("ggplot2")
+theme_set(theme_bw())
+```
+```{r}
+# Récupérer les identifiants des échantillons présents dans la table ASV
+samples.out <- rownames(seqtab.nochim)
+
+# Associer chaque identifiant SRR à sa ligne dans le tableau de métadonnées
+metadata <- tableau[match(samples.out, tableau$Run), ]
+
+# Vérifier que chaque échantillon possède bien ses métadonnées
+stopifnot(!any(is.na(metadata$Run)))
+
+# Construire le tableau des métadonnées
+samdf <- data.frame(
+  SampleName = metadata$Sample.Name,
+  SampleType = metadata$sample_type,
+  CollectionDate = metadata$Collection_Date,
+  Depth = metadata$Depth,
+  Temperature = metadata$temp,
+  Location = metadata$geo_loc_name,
+  row.names = metadata$Run
+)
+
+# Vérifier le tableau obtenu
+print(head(samdf))
+```
+
+```{r}
+# Construire l'objet phyloseq à partir des résultats de DADA2
+ps <- phyloseq(
+  otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+  sample_data(samdf),
+  tax_table(taxa)
+)
+
+# Afficher l'objet phyloseq
+ps
+# Vérifier les correspondances d'échantillons et de taxons
+head(sample_names(ps))
+head(taxa_names(ps))
+head(tax_table(ps))
+```
+
+
+```{r}
+# Extraire les séquences ADN correspondant aux ASV
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+
+# Associer chaque séquence à son identifiant ASV actuel
+names(dna) <- taxa_names(ps)
+
+# Ajouter les séquences ADN à l'objet phyloseq
+ps <- merge_phyloseq(ps, dna)
+
+# Renommer les ASV avec des identifiants courts
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+# Afficher l'objet phyloseq final
+ps
+```
+
+
+
+
+
+
+
+
+
+
